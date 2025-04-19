@@ -1,0 +1,4 @@
+{
+    'num_classes': '10',
+    'data_dir': './inaturalist_12K'
+}

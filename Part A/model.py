@@ -1,166 +1,242 @@
 import torch
+import torch.nn as nn
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-import torch.nn as nn
-from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader,random_split
 import os
+import copy
 import wandb
-from torch.utils.data import DataLoader, Subset
-from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, random_split
+from torchvision.datasets import ImageFolder
+import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
+import numpy as np
+import ast
 
+# Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# print("Using device:", device)
 
 class ConvNN(nn.Module):
-    def __init__(self, numberOfFilters,filterOrganisation, activation,hidden_size, dropout, cnn_layers = 5 ,kernel_size = 3 ,num_classes=10):
+    def __init__(self, numberOfFilters, filterOrganisation, activation, 
+                 hidden_size, dropout, cnn_layers=5, kernel_size=3, num_classes=10):
         super().__init__()
-        self.conv = nn.ModuleList()
-        in_channel = 3
+        
+        self.conv_blocks = nn.ModuleList()
+        in_channels = 3
+        
         for i in range(cnn_layers):
-            self.conv.append(nn.Conv2d(in_channels = in_channel, out_channels=numberOfFilters, kernel_size=kernel_size, stride=1))
-            self.conv.append(nn.BatchNorm2d(numberOfFilters))
-            self.conv.append(activationFunction(activation))
-            self.conv.append(nn.MaxPool2d(kernel_size=2, stride=2))
-            in_channel = numberOfFilters
-            numberOfFilters = min(100,max(32, int(numberOfFilters * filterOrganisation)))
-        self.conv.append(nn.AdaptiveAvgPool2d(1))
-        self.conv.append(nn.Flatten())
-        # Look into it
-        # self.conv.append(activationFunction(activation))
-        self.conv.append(nn.Linear(in_channel, hidden_size))
-        self.conv.append(activationFunction(activation))
-        self.conv.append(nn.Dropout(dropout))
-        self.conv.append(nn.Linear(hidden_size, num_classes))
+            out_channels = int(numberOfFilters * (filterOrganisation ** i))
+            out_channels = max(32, min(100, out_channels))
+            
+            block = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size, padding=1),
+                nn.BatchNorm2d(out_channels),
+                activationFunction(activation),
+                nn.MaxPool2d(2, 2)
+            )
+            self.conv_blocks.append(block)
+            in_channels = out_channels
+        
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels, hidden_size),
+            activationFunction(activation),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, num_classes)
+        )
 
     def forward(self, x):
-        for i in range(len(self.conv)):
-            x = self.conv[i](x)
-        return x
+        for block in self.conv_blocks:
+            x = block(x)
+        return self.classifier(x)
 
-def activationFunction(x):
-    activation = {"ReLU": nn.ReLU(), "GeLU": nn.GELU(), "SiLU": nn.SiLU(), "Mish": nn.Mish(), "LeakyReLU": nn.LeakyReLU()}
-    return activation[x]
+def activationFunction(activation_name):
+    return {
+        "ReLU": nn.ReLU(),
+        "GeLU": nn.GELU(),
+        "SiLU": nn.SiLU(),
+        "Mish": nn.Mish(),
+        "LeakyReLU": nn.LeakyReLU(0.1)
+    }[activation_name]
 
-def evaluate_accuracy(model, dataloader, device):
-    correct = 0
-    total = 0
-    total_loss = 0
-    criterion = nn.CrossEntropyLoss()
-    for images, labels in dataloader:
-        with torch.no_grad():
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            total_loss += loss.item()
-            _, predicted = torch.max(outputs, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-    acc = 100 * correct / total
-    # print(f"Validation Accuracy: {acc:.2f}%")
-    return acc, total_loss/len(dataloader)
+def get_transforms(data_augmentation=False):
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+    
+    if data_augmentation:
+        return transforms.Compose([
+            transforms.Resize(256),
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(15),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ToTensor(),
+            normalize
+        ])
+    
+    return transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        normalize
+    ])
 
-def train_model(model,num_epochs,device,learning_rate, batch_size, dataAugmentation,iswandb=False):
+def prepare_datasets(data_dir, batch_size, data_augmentation=True, num_workers=1):
+    train_transform = get_transforms(data_augmentation=True)
+    val_transform = get_transforms(data_augmentation=False)
+
+    full_train_set = datasets.ImageFolder(root=os.path.join(data_dir, 'train'),transform=train_transform)
+
+    train_size = int(0.8 * len(full_train_set))
+    val_size = len(full_train_set) - train_size
+    train_set, val_set = random_split(full_train_set, [train_size, val_size])
+
+    val_set.dataset = copy.deepcopy(val_set.dataset)
+    val_set.dataset.transform = val_transform
+
+    test_set = datasets.ImageFolder(root=os.path.join(data_dir, 'val'),transform=val_transform)
+
+    return (
+        DataLoader(train_set, batch_size, shuffle=True, num_workers=num_workers, pin_memory=True),
+        DataLoader(val_set, batch_size, shuffle=False, num_workers=num_workers, pin_memory=True),
+        DataLoader(test_set, batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
+    )
+
+def train_model(model, num_epochs, device, learning_rate, batch_size, dataAugmentation, iswandb=False):
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max')
-    prev_Acc = 0
+    # scheduler to prevent the make the learning rate adaptive
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', factor=0.1, patience=2)
+    # To Prevent gradient underflow/overflow
+    scaler = torch.amp.GradScaler(enabled=(device.type == 'cuda'))
+
+    train_loader, val_loader, test_loader = prepare_datasets("./inaturalist_12K", batch_size, dataAugmentation)
+
     for epoch in range(num_epochs):
-        total_loss = 0
+        model.train()
+        epoch_loss = 0.0
         correct = 0
         total = 0
-        train_loader,val_loader,test_loader = data_loader(batch_size=batch_size,data_dir = "./inaturalist_12K",dataAugmentation=dataAugmentation)
+
         for images, labels in train_loader:
             images, labels = images.to(device), labels.to(device)
 
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(device.type == 'cuda')):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
-                _, predicted = torch.max(outputs, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            train_acc = (correct/total)*100
-            total_loss += loss.item()
-            del loss, outputs
 
-        train_loss = total_loss / len(train_loader)
-        val_acc,val_loss = evaluate_accuracy(model, val_loader, device)
-        test_acc,test_loss = evaluate_accuracy(model, test_loader, device)
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {train_loss:.4f}, Val_Acc: {val_acc}, Test_acc : {test_acc}")
+            optimizer.zero_grad()
+            #Scalar to prevent underflow/overflow of gradients
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            epoch_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+        train_acc = 100 * correct / total
+        train_loss = epoch_loss / len(train_loader)
+        val_acc, val_loss = evaluate_accuracy(model, val_loader, device, criterion)
+        test_acc, test_loss = evaluate_accuracy(model, test_loader, device, criterion)
+        scheduler.step(train_acc)
+
         if iswandb:
-            wandb.log({"train_loss": train_loss,"val_loss": val_loss, "val_accuracy": val_acc, "train_accuracy": train_acc})
-        if train_acc - prev_Acc < 0.5:
-            learning_rate = learning_rate * 0.1
-            print(f"Reducing learning rate to {learning_rate}")
-        prev_Acc = train_acc
+            wandb.log({
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "train_acc": train_acc,
+                "val_acc": val_acc,
+                "lr": optimizer.param_groups[0]['lr']
+            })
 
-def transform_image(dataAugmentation=False):
-    if dataAugmentation:
-        transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.RandomRotation(10),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-        ])
-        return transform
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    ])
-    return transform
+        print(f"Epoch {epoch+1}/{num_epochs}")
+        print(f"Train Loss: {train_loss:.4f} | Acc: {train_acc:.2f}%")
+        print(f"Val Loss: {val_loss:.4f} | Acc: {val_acc:.2f}%")
+        print(f"Test Loss: {test_loss:.4f} | Acc: {test_acc:.2f}%")
 
-# def data_loader(data_dir, batch_size,dataAugmentation, num_workers=3):
-#     # transform = transform_image(dataAugmentation=True)
-#     train_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'train'), transform=transform_image(dataAugmentation=dataAugmentation))
-#     train_dataset, val_dataset = random_split(train_dataset, [0.8, 0.2])
-#     val_dataset.dataset.transform = transform_image() # No data augmentation for validation set
-#     test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'val'), transform=transform_image())
+    # test_acc = evaluate_accuracy(model, test_loader, device)
+    # print(f"\nFinal Test Accuracy: {test_acc:.2f}%")
 
-#     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-#     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-#     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+def evaluate_accuracy(model, dataloader, device, criterion=None):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
 
-#     return train_loader, val_loader, test_loader
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            
+            if criterion:
+                loss = criterion(outputs, labels)
+                total_loss += loss.item()
+            
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += (predicted ==labels).sum().item()
 
-def data_loader(data_dir, batch_size, dataAugmentation, num_workers=1):
-    full_dataset = datasets.ImageFolder(
-        root=os.path.join(data_dir, 'train'),
-        transform=transform_image(dataAugmentation=dataAugmentation)
-    )
+    acc = 100 * correct / total
+    return (acc, total_loss/len(dataloader)) if criterion else acc
+
+def log_predictions(model, data_dir="./inaturalist_12K"):
+    # Initialize wandb
+    wandb.init(project="inaturalist-classification", job_type="evaluation")
     
-    # Extract targets (class labels) for stratification
-    targets = [s[1] for s in full_dataset.samples]
-
-    # Perform stratified split
-    train_idx, val_idx = train_test_split(
-        range(len(targets)),
-        test_size=0.2,
-        stratify=targets,
-        random_state=42
-    )
-
-    # Create Subsets
-    train_dataset = Subset(full_dataset, train_idx)
-    val_dataset = Subset(full_dataset, val_idx)
-
-    # Overwrite the transform for validation set (no data augmentation!)
-    val_dataset.dataset.transform = transform_image()  
-
-    # Test set
-    test_dataset = datasets.ImageFolder(
-        root=os.path.join(data_dir, 'val'),
-        transform=transform_image()
-    )
-
-    # Create DataLoaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-
-    return train_loader, val_loader, test_loader
-
+    # Prepare data
+    _, _, test_loader = prepare_datasets(data_dir, batch_size=30, data_augmentation=False)
+    dataset = ImageFolder(root=os.path.join(data_dir, 'val'))
+    class_to_name = {i: name.split('/')[-1] for i, name in enumerate(dataset.classes)}
+    
+    # Get one batch of 30 images
+    images, labels = next(iter(test_loader))
+    images, labels = images.to(device), labels.to(device)
+    
+    with torch.no_grad():
+        outputs = model(images)
+        _, preds = torch.max(outputs, 1)
+    
+    # Create a list of wandb.Image objects with captions
+    wandb_images = []
+    for idx in range(30):
+        # Denormalize image
+        img = images[idx].cpu().numpy().transpose((1, 2, 0))
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        img = std * img + mean
+        img = np.clip(img, 0, 1)
+        
+        # Create caption with prediction info
+        actual_name = class_to_name[labels[idx].item()]
+        pred_name = class_to_name[preds[idx].item()]
+        correct = labels[idx] == preds[idx]
+        caption = (f"✅ Correct" if correct else f"❌ Wrong") + \
+                 f"\nPred: {pred_name}\nActual: {actual_name}"
+        
+        # Create wandb.Image with caption
+        wandb_images.append(wandb.Image(
+            img, 
+            caption=caption
+        ))
+    
+    # Log as a single image carousel
+    wandb.log({
+        "Test_Predictions": wandb_images,
+        "Test_Accuracy": 100*torch.sum(labels==preds)/30
+    })
+    
+    # Additional table logging for reference
+    wandb.log({
+        "Detailed_Predictions": wandb.Table(
+            columns=["Image", "Prediction", "Label", "Correct"],
+            data=[
+                [wandb_images[i], 
+                 class_to_name[preds[i].item()], 
+                 class_to_name[labels[i].item()], 
+                 bool(preds[i] == labels[i])]
+                for i in range(30)
+            ]
+        )
+    })
